@@ -70,6 +70,13 @@ def _extract_date_value(text: str) -> str | None:
 def _extract_time_slot(text: str) -> str | None:
     """Extract a likely HH:MM slot from user utterance."""
     raw = (text or "").lower().strip()
+    
+    match_military = re.search(r"\b([01]\d|2[0-3])([0-5]\d)\b", raw)
+    if match_military:
+        hour = int(match_military.group(1))
+        minute = int(match_military.group(2))
+        return f"{hour:02d}:{minute:02d}"
+    
     match_hhmm = re.search(r"\b([01]?\d|2[0-3])[:.]([0-5]\d)\s*(am|pm)?\b", raw)
     if match_hhmm:
         hour = int(match_hhmm.group(1))
@@ -89,6 +96,11 @@ def _extract_time_slot(text: str) -> str | None:
             hour += 12
         if meridian.startswith("a") and hour == 12:
             hour = 0
+        return f"{hour:02d}:00"
+
+    match_bare_hour = re.search(r"\b([0-9]|1[0-9]|2[0-3])\b", raw)
+    if match_bare_hour:
+        hour = int(match_bare_hour.group(1))
         return f"{hour:02d}:00"
 
     return None
@@ -415,6 +427,7 @@ async def handle_voice_websocket(
 
         session_state["language"] = language
         session_state["preferred_language"] = language
+        session_state["pending_details"] = pending_details
         session_state.setdefault("conversation_history", []).append({"role": "user", "content": text})
         session_state["conversation_history"].append(
             {"role": "assistant", "content": agent_result["response_text"]}

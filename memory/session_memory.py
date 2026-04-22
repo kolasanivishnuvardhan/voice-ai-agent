@@ -20,9 +20,13 @@ class SessionMemory:
 
     def _default_state(self, session_id: str) -> dict[str, Any]:
         """Construct a default session payload."""
+        # Use first existing patient; if none, create temporary UUID (will be mapped later)
+        # Hardcoded to first test patient for now:
+        SAMPLE_PATIENT_ID = "96c5f10f-e610-428a-ac99-4e4291c50918"  # Rahul Verma
+        
         return {
             "session_id": session_id,
-            "patient_id": str(uuid.uuid4()),
+            "patient_id": SAMPLE_PATIENT_ID,
             "language": "en",
             "preferred_language": "en",
             "conversation_history": [],
