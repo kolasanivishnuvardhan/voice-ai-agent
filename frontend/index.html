@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Voice AI Clinical Booking</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; padding: 1rem; background: #f5f8ff; }
+    .card { max-width: 920px; margin: 0 auto; background: #fff; border-radius: 14px; padding: 1rem; box-shadow: 0 8px 24px rgba(0,0,0,0.08); }
+    .voice-bar {
+      margin-top: 0.8rem;
+      border: 1px solid #ddd;
+      border-radius: 999px;
+      background: #fff;
+      min-height: 68px;
+      display: flex;
+      align-items: center;
+      gap: 0.65rem;
+      padding: 0 14px;
+    }
+    .icon-btn {
+      border: none;
+      background: transparent;
+      color: #2a2a2a;
+      font-size: 1.7rem;
+      line-height: 1;
+      cursor: pointer;
+      width: 38px;
+      height: 38px;
+      border-radius: 999px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .icon-btn:hover { background: #f3f5fb; }
+    .icon-btn.primary {
+      background: #275efe;
+      color: #fff;
+    }
+    .icon-btn.primary.recording {
+      background: #d64545;
+    }
+    .icon-btn[disabled] {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .wave-host {
+      flex: 1;
+      height: 44px;
+      border-radius: 10px;
+      background: #fff;
+      display: flex;
+      align-items: center;
+      overflow: hidden;
+    }
+    #waveform {
+      width: 100%;
+      height: 44px;
+      display: block;
+    }
+    .status { color: #444; font-size: 0.9rem; margin-top: 0.45rem; min-height: 20px; }
+    #transcript { height: 320px; overflow-y: auto; border: 1px solid #ddd; padding: 0.7rem; border-radius: 8px; margin-top: 1rem; background: #fafcff; }
+    .line { margin-bottom: 0.6rem; }
+    .user { color: #0a3; }
+    .assistant { color: #14c; }
+    .meta { color: #666; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Real-Time Multilingual Voice AI Agent</h2>
+    <p class="meta">Session: <span id="session"></span></p>
+    <div class="voice-bar">
+  <button id="startBtn" class="icon-btn" title="Start recording">＋</button>
+      <div class="wave-host">
+        <canvas id="waveform" width="760" height="44"></canvas>
+      </div>
+      <button id="cancelBtn" class="icon-btn" title="Cancel recording" disabled>✕</button>
+      <button id="sendBtn" class="icon-btn" title="Stop and send" disabled>✓</button>
+    </div>
+    <div id="micStatus" class="status">Click mic to start speaking, then click ✓ to send.</div>
+    <div id="recordTimer" class="meta">00:00</div>
+    <p class="meta">Last latency: <span id="latency">-</span> ms</p>
+    <div id="transcript"></div>
+  </div>
+
+  <script>
+    const sessionId = crypto.randomUUID();
+    const sessionEl = document.getElementById("session");
+    const transcriptEl = document.getElementById("transcript");
+    const latencyEl = document.getElementById("latency");
+    const startBtn = document.getElementById("startBtn");
+    const cancelBtn = document.getElementById("cancelBtn");
+    const sendBtn = document.getElementById("sendBtn");
+    const micStatus = document.getElementById("micStatus");
+    const recordTimer = document.getElementById("recordTimer");
+    const waveform = document.getElementById("waveform");
+    const waveCtx = waveform.getContext("2d");
+    sessionEl.textContent = sessionId;
+
+    let socket = null;
+    let mediaRecorder = null;
+    let mediaStream = null;
+    let visualAudioCtx = null;
+    let analyser = null;
+    let dataArray = null;
+    let chunks = [];
+    let isRecording = false;
+    let shouldSend = false;
+    let timerInterval = null;
+    let recordStartTs = 0;
+    let rafId = null;
+    const MIN_RECORDING_MS = 800;
+    const MIN_AUDIO_BYTES = 1200;
+
+    function appendLine(role, text) {
+      const div = document.createElement("div");
+      div.className = `line ${role}`;
+      div.textContent = `${role === "user" ? "You" : "Agent"}: ${text}`;
+      transcriptEl.appendChild(div);
+      transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    }
+
+    async function openSocket() {
+      socket = new WebSocket(`ws://localhost:8000/ws/voice/${sessionId}`);
+      socket.binaryType = "arraybuffer";
+
+      socket.onclose = () => {
+        micStatus.textContent = "Connection closed. Click mic to reconnect.";
+      };
+
+      socket.onerror = () => {
+        micStatus.textContent = "WebSocket error. Please retry.";
+      };
+
+      socket.onmessage = async (event) => {
+        if (typeof event.data === "string") {
+          const payload = JSON.parse(event.data);
+          if (payload.type === "metadata") {
+            latencyEl.textContent = payload.latency_ms;
+            if (payload.user_text) appendLine("user", payload.user_text);
+            if (payload.assistant_text) appendLine("assistant", payload.assistant_text);
+            micStatus.textContent = "Click mic to speak again.";
+          }
+          return;
+        }
+
+        if (isRecording) {
+          return;
+        }
+
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const arr = event.data instanceof ArrayBuffer ? event.data : await event.data.arrayBuffer();
+        const decoded = await audioCtx.decodeAudioData(arr.slice(0));
+        const src = audioCtx.createBufferSource();
+        src.buffer = decoded;
+        src.connect(audioCtx.destination);
+        src.start();
+      };
+
+      return new Promise((resolve, reject) => {
+        socket.onopen = () => resolve();
+        socket.onerror = reject;
+      });
+    }
+
+    function drawIdleWave() {
+      waveCtx.clearRect(0, 0, waveform.width, waveform.height);
+      waveCtx.fillStyle = "#ffffff";
+      waveCtx.fillRect(0, 0, waveform.width, waveform.height);
+      waveCtx.strokeStyle = "#c9ced8";
+      waveCtx.lineWidth = 1.5;
+      waveCtx.setLineDash([4, 4]);
+      waveCtx.beginPath();
+      waveCtx.moveTo(0, waveform.height / 2);
+      waveCtx.lineTo(waveform.width, waveform.height / 2);
+      waveCtx.stroke();
+      waveCtx.setLineDash([]);
+    }
+
+    function setRecordingUI(active) {
+      startBtn.classList.toggle("recording", active);
+      startBtn.classList.toggle("primary", active);
+      startBtn.textContent = active ? "●" : "＋";
+      startBtn.title = active ? "Recording..." : "Start recording";
+      cancelBtn.disabled = !active;
+      sendBtn.disabled = !active;
+    }
+
+    function drawWaveform() {
+      if (!isRecording || !analyser || !dataArray) {
+        return;
+      }
+
+      analyser.getByteTimeDomainData(dataArray);
+      waveCtx.clearRect(0, 0, waveform.width, waveform.height);
+      waveCtx.fillStyle = "#ffffff";
+      waveCtx.fillRect(0, 0, waveform.width, waveform.height);
+
+      waveCtx.lineWidth = 2;
+      waveCtx.strokeStyle = "#222";
+      waveCtx.beginPath();
+
+      const sliceWidth = waveform.width / dataArray.length;
+      let x = 0;
+      for (let i = 0; i < dataArray.length; i++) {
+        const v = dataArray[i] / 128.0;
+        const y = (v * waveform.height) / 2;
+        if (i === 0) {
+          waveCtx.moveTo(x, y);
+        } else {
+          waveCtx.lineTo(x, y);
+        }
+        x += sliceWidth;
+      }
+      waveCtx.lineTo(waveform.width, waveform.height / 2);
+      waveCtx.stroke();
+
+      rafId = requestAnimationFrame(drawWaveform);
+    }
+
+    function updateTimer() {
+      const elapsedMs = Date.now() - recordStartTs;
+      const totalSec = Math.floor(elapsedMs / 1000);
+      const mm = String(Math.floor(totalSec / 60)).padStart(2, "0");
+      const ss = String(totalSec % 60).padStart(2, "0");
+      recordTimer.textContent = `${mm}:${ss}`;
+    }
+
+    async function startCapture() {
+      shouldSend = false;
+      chunks = [];
+
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+
+      const recorderOptions = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+        ? { mimeType: "audio/webm;codecs=opus" }
+        : MediaRecorder.isTypeSupported("audio/webm")
+          ? { mimeType: "audio/webm" }
+          : undefined;
+      mediaRecorder = recorderOptions ? new MediaRecorder(mediaStream, recorderOptions) : new MediaRecorder(mediaStream);
+
+      visualAudioCtx = new AudioContext();
+      const source = visualAudioCtx.createMediaStreamSource(mediaStream);
+      analyser = visualAudioCtx.createAnalyser();
+      analyser.fftSize = 1024;
+      source.connect(analyser);
+      dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+      recordStartTs = Date.now();
+      isRecording = true;
+      recordTimer.textContent = "00:00";
+      setRecordingUI(true);
+      micStatus.textContent = "Listening... click ✓ to send or ✕ to cancel.";
+
+      timerInterval = setInterval(updateTimer, 250);
+      drawWaveform();
+
+      mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
+      mediaRecorder.onstop = async () => {
+        const blob = new Blob(chunks, { type: mediaRecorder.mimeType || "audio/webm" });
+        const elapsed = Date.now() - recordStartTs;
+        const validSpeech = shouldSend && elapsed >= MIN_RECORDING_MS && blob.size >= MIN_AUDIO_BYTES;
+
+        if (timerInterval) {
+          clearInterval(timerInterval);
+          timerInterval = null;
+        }
+        if (rafId) {
+          cancelAnimationFrame(rafId);
+          rafId = null;
+        }
+
+        setRecordingUI(false);
+        drawIdleWave();
+
+        if (validSpeech && socket && socket.readyState === WebSocket.OPEN) {
+          micStatus.textContent = "Transcribing your speech...";
+          const buf = await blob.arrayBuffer();
+          socket.send(buf);
+        } else if (validSpeech && (!socket || socket.readyState !== WebSocket.OPEN)) {
+          micStatus.textContent = "Connection lost. Please click + and try again.";
+          appendLine("assistant", "Connection was interrupted before sending audio. Please retry.");
+        } else if (shouldSend && blob.size < MIN_AUDIO_BYTES) {
+          micStatus.textContent = "Audio too short/quiet. Please speak a bit louder and retry.";
+          appendLine("assistant", "I couldn't hear enough audio. Please try again.");
+        } else if (shouldSend && elapsed < MIN_RECORDING_MS) {
+          micStatus.textContent = "Recording was too short. Please speak for at least 1 second.";
+          appendLine("assistant", "Please speak for a little longer and try again.");
+        } else if (!shouldSend) {
+          micStatus.textContent = "Recording cancelled.";
+        } else {
+          micStatus.textContent = "No clear speech captured. Please try again.";
+          appendLine("assistant", "I couldn't hear clear speech. Please try again and speak for 1-2 seconds.");
+        }
+
+        if (mediaStream) {
+          mediaStream.getTracks().forEach((t) => t.stop());
+        }
+        if (visualAudioCtx) {
+          await visualAudioCtx.close();
+        }
+        mediaStream = null;
+        visualAudioCtx = null;
+        analyser = null;
+        dataArray = null;
+        isRecording = false;
+        shouldSend = false;
+        chunks = [];
+        if (validSpeech) {
+          micStatus.textContent = "Waiting for AI response...";
+        }
+      };
+
+      mediaRecorder.start(250);
+    }
+
+    async function ensureSocketReady() {
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        await openSocket();
+      }
+    }
+
+    startBtn.addEventListener("click", async () => {
+      if (isRecording) {
+        return;
+      }
+
+      micStatus.textContent = "Requesting microphone permission...";
+      try {
+        await ensureSocketReady();
+        await startCapture();
+      } catch (_err) {
+        micStatus.textContent = "Could not start microphone. Please check browser mic permissions.";
+      }
+    });
+
+    cancelBtn.addEventListener("click", () => {
+      if (isRecording && mediaRecorder && mediaRecorder.state === "recording") {
+        shouldSend = false;
+        micStatus.textContent = "Cancelling recording...";
+        mediaRecorder.stop();
+      }
+    });
+
+    sendBtn.addEventListener("click", () => {
+      if (isRecording && mediaRecorder && mediaRecorder.state === "recording") {
+        shouldSend = true;
+        micStatus.textContent = "Stopping and sending...";
+        mediaRecorder.requestData();
+        mediaRecorder.stop();
+      }
+    });
+
+    drawIdleWave();
+  </script>
+</body>
+</html>
